@@ -651,6 +651,10 @@ class MuseDriver {
     const p = await this.requirePage()
     if (chat !== undefined && chat !== null && chat !== '') await this._openChat(chat)
     else await this.gotoApp()
+    // A thread opened in a fresh tab (any tab, now that calls get their own) renders its messages and
+    // images a few seconds after the composer: wait for an assistant image/link before scanning.
+    const hasMedia = () => p.locator(`${SELECTORS.assistant} img[src], ${SELECTORS.assistant} video[src], ${SELECTORS.assistant} a[href]`).count()
+    for (let t = 0; t < 40 && !(await hasMedia().catch(() => 0)); t++) await sleep(500)
     const items = await p.locator(SELECTORS.message).evaluateAll((els) =>
       els
         .map((el, index) => {

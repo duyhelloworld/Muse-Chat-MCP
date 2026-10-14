@@ -25,6 +25,8 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
+import { spawn } from 'node:child_process'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { fileURLToPath } from 'node:url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -55,94 +57,152 @@ const LAUNCH_TIMEOUT = Number(process.env.MUSE_LAUNCH_TIMEOUT_MS || 60000)
 // an append-only SSE stream).
 const STREAM_QUIET_MS = Number(process.env.MUSE_STREAM_QUIET_MS || 600)
 
+// Multi-agent: every MCP client (each Claude session, each Orca tab) spawns its own muse-server, and a
+// Chrome profile can only be opened by one browser. So nobody owns the browser: the first server starts
+// Chrome DETACHED on the profile with a debugging port, and every server (that one included) attaches to
+// it over CDP. A server exiting no longer closes the window under the others.
+const CDP_PORT = Number(process.env.MUSE_CDP_PORT || 9333)
+const CHROME_PATH = process.env.MUSE_CHROME_PATH ||
+  (process.platform === 'darwin' ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+    : process.platform === 'win32' ? 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
+      : 'google-chrome')
+// Each call runs in its own tab, so parallel agents never type into or navigate each other's thread.
+const MAX_TABS = Number(process.env.MUSE_MAX_TABS || 4)
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 class MuseDriver {
   constructor() {
     this.ctx = null
-    this.page = null
     this.browser = null
     this.lastError = null
-    this._queue = Promise.resolve()
+    this._tab = new AsyncLocalStorage() // the tab of the call in flight
+    this._lastPage = null               // tab of the latest call: target of follow-ups with no chat given
+    this._tabs = new Set()              // tabs this process opened
+    this._idle = []
+    this._waiters = []
+    this._launching = null
   }
 
-  /** Serialize browser actions (one window = one action at a time). */
-  _serial(fn) {
-    const run = this._queue.then(fn, fn)
-    this._queue = run.then(() => {}, () => {})
-    return run
+  /** The tab of the current call (inside _serial), else the one the latest call used. */
+  get page() {
+    const t = this._tab.getStore()
+    return t || this._lastPage
+  }
+
+  /**
+   * Run fn in a tab of its own (was: one shared tab, one call at a time). `prefer` (a thread URL or id)
+   * picks the idle tab already showing that thread, then the latest call's tab, then any idle one; with
+   * none idle a new tab opens, up to MAX_TABS per process, after which calls wait their turn.
+   */
+  async _serial(fn, prefer) {
+    await this.launch()
+    const page = await this._acquire(prefer)
+    try {
+      return await this._tab.run(page, fn)
+    } finally {
+      this._lastPage = page
+      this._release(page)
+    }
+  }
+
+  async _acquire(prefer) {
+    for (;;) {
+      this._idle = this._idle.filter((p) => !p.isClosed())
+      for (const p of [...this._tabs]) if (p.isClosed()) this._tabs.delete(p)
+      if (this._idle.length) {
+        const want = prefer ? String(prefer) : null
+        let i = want ? this._idle.findIndex((p) => p.url().includes(want)) : -1
+        if (i < 0) i = this._idle.indexOf(this._lastPage)
+        if (i < 0) i = 0
+        return this._idle.splice(i, 1)[0]
+      }
+      if (this._tabs.size < MAX_TABS) {
+        const p = await this.ctx.newPage()
+        p.setDefaultTimeout(LAUNCH_TIMEOUT)
+        this._tabs.add(p)
+        return p
+      }
+      await new Promise((r) => this._waiters.push(r))
+    }
+  }
+
+  _release(page) {
+    if (!page.isClosed()) this._idle.push(page)
+    const w = this._waiters.shift()
+    if (w) w()
   }
 
   isRunning() {
-    return !!(this.ctx && this.page && !this.page.isClosed())
+    return !!(this.ctx && this.browser && this.browser.isConnected())
   }
 
   async launch() {
-    if (this.isRunning()) return this.page
-    const { chromium } = await import('playwright-core')
+    if (this.isRunning()) return
+    if (!this._launching) this._launching = this._launch().finally(() => { this._launching = null })
+    return this._launching
+  }
 
-    const launchPersistent = () =>
-      chromium.launchPersistentContext(PROFILE_DIR, {
-        channel: CHANNEL,
-        headless: HEADLESS,
-        viewport: { width: 1366, height: 900 },
-        acceptDownloads: false,
-        ignoreDefaultArgs: ['--enable-automation'],
-        args: [
-          '--no-first-run',
-          '--no-default-browser-check',
-          '--disable-blink-features=AutomationControlled',
-          '--disable-features=Translate,OptimizationGuideModelDownloading',
-        ],
+  async _launch() {
+    const { chromium } = await import('playwright-core')
+    const attach = async (url) => {
+      const b = await chromium.connectOverCDP(url, { timeout: 5000 })
+      this.browser = b
+      this.ctx = b.contexts()[0] || (await b.newContext())
+      b.on('disconnected', () => {
+        this.browser = null
+        this.ctx = null
+        this._lastPage = null
+        this._tabs.clear()
+        this._idle = []
       })
-    const attachCDP = async (url) => {
-      this.browser = await chromium.connectOverCDP(url)
-      this.ctx = this.browser.contexts()[0] || (await this.browser.newContext())
     }
 
     if (process.env.MUSE_CDP) {
-      // Escape hatch: attach to a Chrome you already started with
-      //   chrome.exe --remote-debugging-port=9222
-      // Reuses all your existing logins; the driver will not own the browser.
-      try {
-        await attachCDP(process.env.MUSE_CDP)
-      } catch (e) {
-        this.browser = null
-        this.ctx = null
-        this.ctx = await launchPersistent()
-      }
-    } else {
-      try {
-        this.ctx = await launchPersistent()
-      } catch (e) {
-        // The profile is probably locked by an already-running Chrome (e.g. one
-        // started with --remote-debugging-port=9222). Attach to it instead of
-        // failing; only if nothing is listening on the CDP port do we rethrow.
-        const msg = String((e && e.message) || e)
-        if (!/singleton|lock|profile|already running|browser is already/i.test(msg)) throw e
-        try {
-          await attachCDP('http://127.0.0.1:9222')
-        } catch {
-          throw new Error(
-            `Could not open the Muse Chrome profile (${PROFILE_DIR}): it is locked by ` +
-              `another Chrome window, and no debugger is listening on 127.0.0.1:9222. ` +
-              `Close the Chrome window using this profile, or restart it with ` +
-              `--remote-debugging-port=9222 and set MUSE_CDP=http://127.0.0.1:9222.`,
-          )
-        }
-      }
+      // Escape hatch: attach to a Chrome you started yourself with --remote-debugging-port.
+      await attach(process.env.MUSE_CDP)
+      return
     }
+    const url = `http://127.0.0.1:${CDP_PORT}`
+    try {
+      await attach(url) // another muse-server already started it
+      return
+    } catch { /* nobody has: start it */ }
 
-    this.ctx.on('close', () => {
-      this.ctx = null
-      this.page = null
-      this.browser = null
-    })
-    const pages = this.ctx.pages()
-    this.page = pages.find((p) => p.url().includes('muse.ai')) || pages[0] || (await this.ctx.newPage())
-    this.page.setDefaultTimeout(LAUNCH_TIMEOUT)
-    await this.gotoApp()
-    return this.page
+    const args = [
+      `--user-data-dir=${PROFILE_DIR}`,
+      `--remote-debugging-port=${CDP_PORT}`,
+      '--no-first-run',
+      '--no-default-browser-check',
+      // Same cookie encryption as the playwright-launched Chrome that did the Meta login (it always passes
+      // these): without them Chrome uses the real macOS keychain, cannot decrypt the stored cookies, and
+      // muse.ai comes up logged out.
+      '--use-mock-keychain',
+      '--password-store=basic',
+      '--disable-blink-features=AutomationControlled',
+      '--disable-features=Translate,OptimizationGuideModelDownloading',
+      // calls run in background tabs: keep them at full speed
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-renderer-backgrounding',
+      '--window-size=1366,900',
+      ...(HEADLESS ? ['--headless=new'] : []),
+      APP_URL,
+    ]
+    const child = spawn(CHROME_PATH, args, { detached: true, stdio: 'ignore' })
+    child.on('error', () => {})
+    child.unref()
+    const deadline = Date.now() + 20000
+    let last = null
+    while (Date.now() < deadline) {
+      await sleep(500)
+      try { await attach(url); return } catch (e) { last = e }
+    }
+    throw new Error(
+      `Started Chrome on ${PROFILE_DIR} but nothing answered on ${url}: ${last && last.message}. ` +
+        `A Chrome opened on this profile WITHOUT --remote-debugging-port (an older muse-server) is probably ` +
+        `holding it - quit that Muse window, then call again.`,
+    )
   }
 
   async gotoApp() {
@@ -155,6 +215,7 @@ class MuseDriver {
 
   async requirePage() {
     if (!this.isRunning()) await this.launch()
+    if (!this.page) throw new Error('no tab: call through _serial')
     return this.page
   }
 
@@ -193,26 +254,35 @@ class MuseDriver {
   }
 
   async status() {
-    const running = this.isRunning()
-    const url = running ? this.page.url() : null
-    if (!running) {
-      return { browserRunning: false, url: null, loggedIn: false, composerReady: false, profileDir: PROFILE_DIR, headless: HEADLESS }
+    if (!this.isRunning()) {
+      try { await this.launch() } catch (e) {
+        return { browserRunning: false, url: null, loggedIn: false, composerReady: false, profileDir: PROFILE_DIR, headless: HEADLESS, error: e.message }
+      }
     }
-    const auth = await this.checkAuth()
-    const composerReady = await this.hasComposer()
-    return {
-      browserRunning: true,
-      url,
-      loggedIn: auth.ok,
-      viewerId: auth.viewerId || null,
-      composerReady,
-      profileDir: PROFILE_DIR,
-      headless: HEADLESS,
-    }
+    return this._serial(async () => {
+      await this.gotoApp()
+      const auth = await this.checkAuth()
+      const composerReady = await this.hasComposer()
+      return {
+        browserRunning: true,
+        url: this.page.url(),
+        loggedIn: auth.ok,
+        viewerId: auth.viewerId || null,
+        composerReady,
+        profileDir: PROFILE_DIR,
+        headless: HEADLESS,
+        cdp: `127.0.0.1:${CDP_PORT}`,
+        tabs: this._tabs.size,
+      }
+    })
   }
 
   /** Open the app and, if needed, wait for the user to complete Meta login. */
   async login(timeoutMs = 300000) {
+    return this._serial(() => this._login(timeoutMs))
+  }
+
+  async _login(timeoutMs) {
     await this.gotoApp()
     const deadline = Date.now() + timeoutMs
     while (Date.now() < deadline) {
@@ -447,7 +517,7 @@ class MuseDriver {
 
   /** Send a prompt and wait for the full assistant reply. */
   async chat(prompt, opts = {}) {
-    return this._serial(() => this._run(prompt, opts))
+    return this._serial(() => this._run(prompt, opts), opts.chat)
   }
 
   /**
@@ -455,7 +525,7 @@ class MuseDriver {
    * @param {(fullText:string)=>void} opts.onDelta called with the cumulative reply text
    */
   async chatStream(prompt, opts = {}) {
-    return this._serial(() => this._run(prompt, opts))
+    return this._serial(() => this._run(prompt, opts), opts.chat)
   }
 
   async readLast() {
@@ -501,7 +571,7 @@ class MuseDriver {
    *   - null/undefined   -> the home / main chat
    */
   async openChat(target) {
-    return this._serial(() => this._openChat(target))
+    return this._serial(() => this._openChat(target), typeof target === 'string' ? target : undefined)
   }
 
   async _openChat(target) {
@@ -556,7 +626,7 @@ class MuseDriver {
 
   /** Extract media links (images/videos/attachments) from a chat's messages, optionally downloading. */
   async chatMedia(chat, opts = {}) {
-    return this._serial(() => this._chatMedia(chat, opts))
+    return this._serial(() => this._chatMedia(chat, opts), typeof chat === 'string' ? chat : undefined)
   }
 
   async _chatMedia(chat, { download = false, dir } = {}) {
@@ -662,21 +732,16 @@ class MuseDriver {
     return { ...info, html: (info.html || '').slice(0, maxChars) }
   }
 
+  /** Close this process's tabs and detach. The shared Chrome stays up for the other servers. */
   async close() {
-    if (this.browser) {
-      // CDP-attached: disconnect only, never kill the user's browser.
-      await this.browser.close().catch(() => {})
-      this.browser = null
-      this.ctx = null
-      this.page = null
-      return { ok: true, disconnected: true }
-    }
-    if (this.ctx) {
-      await this.ctx.close().catch(() => {})
-      this.ctx = null
-      this.page = null
-    }
-    return { ok: true }
+    for (const p of this._tabs) await p.close().catch(() => {})
+    this._tabs.clear()
+    this._idle = []
+    this._lastPage = null
+    if (this.browser) await this.browser.close().catch(() => {}) // CDP-attached: disconnects only
+    this.browser = null
+    this.ctx = null
+    return { ok: true, disconnected: true }
   }
 }
 

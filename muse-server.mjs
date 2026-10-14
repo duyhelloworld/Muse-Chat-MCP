@@ -78,7 +78,7 @@ export function buildServer() {
     'muse_chat',
     {
       title: 'Chat with Muse',
-      description: 'Send a prompt to Muse and return the assistant reply once streaming finishes. Uses your own logged-in session and token quota.',
+      description: 'Send a prompt to Muse and return the assistant reply once streaming finishes. Uses your own logged-in session and token quota. Each call runs in its own tab, so several agents can chat at once; keep the returned threadUrl and pass it as chat to follow-ups (muse_chat, muse_media) to stay in your thread.',
       inputSchema: {
         prompt: z.string().optional().describe('The message to send. May be empty when attaching files.'),
         timeout_sec: z.number().int().positive().max(1800).optional().describe('Max seconds to wait for the reply (default 240).'),
@@ -146,7 +146,7 @@ export function buildServer() {
     'muse_media',
     {
       title: 'Muse chat media',
-      description: 'Extract image/video/attachment links from a chat (Muse replies with share links for generated media). Optionally download them.',
+      description: 'Extract image/video/attachment links from a chat (Muse replies with share links for generated media). Optionally download them. Several agents may share Muse at once: pass chat = the threadUrl muse_chat returned, or you may read another agent\'s thread.',
       inputSchema: {
         chat: z.union([z.string(), z.number()]).optional().describe('Chat to open first (title, index, URL, or id).'),
         download: z.boolean().optional().describe('Download the media to disk (default false).'),

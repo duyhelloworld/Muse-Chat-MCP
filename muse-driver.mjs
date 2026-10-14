@@ -128,7 +128,13 @@ class MuseDriver {
   }
 
   _release(page) {
-    if (!page.isClosed()) this._idle.push(page)
+    if (!page.isClosed()) {
+      if (this._idle.length >= 1) {
+        this._tabs.delete(page)
+        if (this._lastPage === page) this._lastPage = this._idle[this._idle.length - 1]
+        page.close().catch(() => {})
+      } else this._idle.push(page)
+    }
     const w = this._waiters.shift()
     if (w) w()
   }
@@ -296,17 +302,29 @@ class MuseDriver {
   async _newChat() {
     const p = await this.requirePage()
     await this.gotoApp()
-    // Prefer the app's own "New side chat" control (reliable); fall back to the home composer.
-    try {
-      const btn = p.getByRole('button', { name: /new side chat/i })
-      if (await btn.count()) {
-        await btn.first().click({ timeout: 5000 })
-        await sleep(1200)
-        await this.waitForComposer()
-        return { ok: true, url: p.url() }
-      }
-    } catch { /* fall through */ }
-    await p.goto(APP_URL, { waitUntil: 'domcontentloaded', timeout: LAUNCH_TIMEOUT })
+    // "New side chat" now sits behind Chats (hatch-chat-switcher-trigger) -> Side chat options. The old
+    // fallback - reload the home composer - silently dropped every "new thread" into the ONE main chat,
+    // where parallel callers then read each other's replies. So no fallback: a new thread or an error.
+    await p.keyboard.press('Escape').catch(() => {})
+    const compose = p.locator('[data-testid="hatch-chat-compose"]').first()
+    const menuItem = p.getByRole('menuitem', { name: /new side chat/i }).first()
+    const visible = (l) => l.isVisible().catch(() => false)
+    // Wide window: the sidebar's "+" by Side chats IS hatch-chat-compose. Narrow: it hides behind the
+    // Chats switcher. Wait for whichever renders - checking once raced the app still hydrating.
+    const trigger = p.locator('[data-testid="hatch-chat-switcher-trigger"]').first()
+    await compose.or(trigger).first().waitFor({ state: 'visible', timeout: 30000 })
+    if (!(await visible(compose))) {
+      await trigger.click({ timeout: 5000 })
+      await sleep(700)
+    }
+    if (await visible(compose)) {
+      await compose.click({ timeout: 10000 })
+    } else {
+      await p.locator('[data-testid="hatch-side-chats-options"]').first().click({ timeout: 10000 })
+      await sleep(700)
+      await menuItem.click({ timeout: 10000 })
+    }
+    await sleep(1200)
     await this.waitForComposer()
     return { ok: true, url: p.url() }
   }

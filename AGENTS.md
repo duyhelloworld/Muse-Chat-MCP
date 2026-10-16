@@ -10,7 +10,8 @@ driving a real, logged-in Chrome with Playwright. See `README.md` for usage.
 ## Map
 
 - `muse-driver.mjs` — browser driver (selectors, `_run`/`chat`/`chatStream`, `_serial`).
-- `muse-server.mjs` — MCP stdio server (7 tools) + shim bootstrap; `--self-test`,
+- `muse-media.mjs` — pure image helpers on `sharp` (PNG conversion, `changedPct`, dHash).
+- `muse-server.mjs` — MCP stdio server + shim bootstrap; `--self-test`,
   `--dump-dom`, `--serve-only`.
 - `muse-openai-shim.mjs` — OpenAI shim (`/v1/models`, `/v1/chat/completions`).
 - `muse-cli.mjs` — CLI over the shim.

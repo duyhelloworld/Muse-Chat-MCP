@@ -112,7 +112,7 @@ Add to `claude_desktop_config.json`:
 | `muse_chats` | `query?` | list chats (Main chat / Channels / Side chats), optional title filter |
 | `muse_open_chat` | `target` | open a chat (title, index, URL, or id) |
 | `muse_read_chat` | `chat?`, `max?` | messages of a chat (all roles, with media links) |
-| `muse_media` | `chat?`, `download?`, `dir?` | image/video/attachment links from a chat (optionally downloaded) |
+| `muse_media` | `chat?`, `as_image?`, `which?`, `max_size?`, `baseline?`, `download?`, `dir?` | media links + the newest image inline as PNG, with `changedPct` vs the previous image (optionally downloaded) |
 | `muse_dump_dom` | `max_chars?` | element counts + transcript HTML (selector debugging) |
 | `muse_close` | – | closes the browser (disconnect-only if CDP-attached) |
 
@@ -129,6 +129,11 @@ message before sending:
 
 Muse accepts images, video and documents (the composer's file input has **no** `accept`
 filter). Files are set directly on the hidden composer input — no OS file dialog.
+
+Uploads are bounded: URLs are fetched with a 30 s timeout and 2 retries (4xx fails fast), local
+paths must exist, and the call waits until the composer shows a preview chip per file — or fails
+with `attachment did not register` instead of hanging. Tune with `MUSE_ATTACH_FETCH_TIMEOUT_MS`
+and `MUSE_ATTACH_TIMEOUT_MS`.
 
 ### Sessions (multiple chats)
 
@@ -147,7 +152,13 @@ List them, then target any one for reading or sending:
 When asked, Muse makes media and replies with a share link (`https://muse.ai/files/<…>/….mp4|.png`).
 Extract and download them:
 
-- **MCP** — `muse_media { chat?, download?, dir? }`.
+- **MCP** — `muse_media { chat?, as_image?, which?, max_size?, baseline?, download?, dir? }`.
+  Returns the newest image (or `which: "all"`) as an inline **image block**, converted from webp
+  to PNG and capped at `max_size` px (default 1024), so the client can look at it directly.
+  It also reports `changedPct` (0–100) and `changed` for the newest image vs the previous one —
+  Muse sometimes says it edited an image when nothing changed. Pass `baseline` (a file path, or
+  the `hash` from an earlier call) to compare across turns. UI icons under 256 px are skipped.
+  `as_image: false` gives the old links-only result.
 - **HTTP** — `GET /v1/muse/media?target=<chat>&download=1&dir=<dir>`.
 - **CLI** — `--media [<chat>] [--download] [--dir <dir>]`.
 

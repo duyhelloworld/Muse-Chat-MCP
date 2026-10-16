@@ -28,6 +28,7 @@ import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { fileURLToPath } from 'node:url'
+import { toPng, dimensions, compare, hashHex, hammingHex, DEFAULT_MAX_SIZE, CHANGED_THRESHOLD_PCT } from './muse-media.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -38,6 +39,8 @@ export const SELECTORS = {
   actionSlot: '[data-hatch-composer-action-slot]',
   fileInput: '[data-hatch-composer-root] input[type="file"]',
   attachButton: '[data-hatch-composer-root] button[aria-label="Attach file"]',
+  // One per attached file: the "x" on the preview chip the app renders once it accepted the file.
+  attachmentChip: '[data-hatch-composer-root] button[aria-label="Remove attachment"]',
   message: '[data-message-item]',
   threadRow: '[data-testid="hatch-thread-row"]',
   assistant: '[data-message-item][data-message-role="assistant"]',
@@ -70,6 +73,39 @@ const CHROME_PATH = process.env.MUSE_CHROME_PATH ||
 const MAX_TABS = Number(process.env.MUSE_MAX_TABS || 4)
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// Attachments: a remote fetch with no deadline used to hang muse_chat until its own 600s timeout with no
+// error. Every step now has a deadline and a specific error.
+const ATTACH_FETCH_TIMEOUT_MS = Number(process.env.MUSE_ATTACH_FETCH_TIMEOUT_MS || 30000)
+const ATTACH_FETCH_RETRIES = 2
+const ATTACH_TIMEOUT_MS = Number(process.env.MUSE_ATTACH_TIMEOUT_MS || 30000)
+// muse_media fetches at most this many of a thread's newest media, so a long thread stays bounded.
+const MAX_MEDIA_FETCH = 12
+// Images whose sides are both under this are UI icons (Gmail/Calendar share badges, s200x200), not output.
+const MIN_MEDIA_SIDE = 256
+
+/** fetch with a timeout per attempt; retries network errors/timeouts/5xx, fails fast on 4xx. */
+async function fetchWithTimeout(url, { timeoutMs = ATTACH_FETCH_TIMEOUT_MS, retries = ATTACH_FETCH_RETRIES } = {}) {
+  let lastErr
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
+      if (res.ok) return res
+      if (res.status < 500) throw Object.assign(new Error(`attachment fetch failed: ${url} -> HTTP ${res.status}`), { fatal: true })
+      lastErr = new Error(`HTTP ${res.status}`)
+    } catch (err) {
+      if (err.fatal) throw err
+      lastErr = err && err.name === 'TimeoutError' ? new Error(`timed out after ${timeoutMs}ms`) : err
+    }
+    if (attempt < retries) await sleep(300 * (attempt + 1)) // short backoff: a flaky CDN, not a rate limit
+  }
+  throw new Error(`attachment fetch gave up after ${retries + 1} attempt(s): ${url} -> ${(lastErr && lastErr.message) || lastErr}`)
+}
+
+const localFile = (p) => {
+  if (!fs.existsSync(p)) throw new Error(`attachment file not found: ${p}`)
+  return p
+}
 
 class MuseDriver {
   constructor() {
@@ -358,18 +394,17 @@ class MuseDriver {
           continue
         }
       }
-      if (e.url && /^file:\/\//i.test(e.url)) { out.push(fileURLToPath(e.url)); continue }
+      if (e.url && /^file:\/\//i.test(e.url)) { out.push(localFile(fileURLToPath(e.url))); continue }
       if (e.url && /^https?:\/\//i.test(e.url)) {
-        const res = await fetch(e.url)
-        if (!res.ok) throw new Error(`failed to fetch attachment ${e.url}: ${res.status}`)
+        const res = await fetchWithTimeout(e.url)
         const buf = Buffer.from(await res.arrayBuffer())
         let name = e.name
         if (!name) { try { name = decodeURIComponent(new URL(e.url).pathname.split('/').pop()) || 'attachment' } catch { name = 'attachment' } }
         out.push({ name, mimeType: res.headers.get('content-type') || e.mimeType || 'application/octet-stream', buffer: buf })
         continue
       }
-      if (e.url) { out.push(e.url); continue } // bare local path passed via `url`
-      if (e.path) out.push(e.path)
+      if (e.url) { out.push(localFile(e.url)); continue } // bare local path passed via `url`
+      if (e.path) out.push(localFile(e.path))
     }
     return out
   }
@@ -382,12 +417,26 @@ class MuseDriver {
   async _attachFiles(files) {
     const payloads = await this._toFilePayloads(files)
     if (!payloads.length) return { ok: true, count: 0 }
-    const p = await this.requirePage()
+    await this.requirePage()
     await this.gotoApp()
     await this.waitForComposer()
-    await p.locator(SELECTORS.fileInput).first().setInputFiles(payloads)
-    await sleep(600) // let the app register the attachment(s)
+    await this._setAttachments(payloads)
     return { ok: true, count: payloads.length }
+  }
+
+  /** Put payloads on the composer and wait until the app shows a chip for each, instead of a blind sleep. */
+  async _setAttachments(payloads) {
+    const p = await this.requirePage()
+    const chips = p.locator(SELECTORS.attachmentChip)
+    const before = await chips.count()
+    await p.locator(SELECTORS.fileInput).first().setInputFiles(payloads, { timeout: ATTACH_TIMEOUT_MS })
+    const deadline = Date.now() + ATTACH_TIMEOUT_MS
+    while ((await chips.count()) < before + payloads.length) {
+      if (Date.now() > deadline) {
+        throw new Error(`attachment did not register within ${ATTACH_TIMEOUT_MS}ms: ${(await chips.count()) - before}/${payloads.length} file(s) shown in the composer. Check the file type, or muse_dump_dom if the chip markup changed.`)
+      }
+      await sleep(250)
+    }
   }
 
   async waitForComposer(timeoutMs = 90000) {
@@ -439,10 +488,7 @@ class MuseDriver {
     // Attach images/videos/files (if any) before typing the prompt.
     if (hasFiles) {
       const payloads = await this._toFilePayloads(files)
-      if (payloads.length) {
-        await p.locator(SELECTORS.fileInput).first().setInputFiles(payloads)
-        await sleep(800) // let the app ingest + preview the attachment(s)
-      }
+      if (payloads.length) await this._setAttachments(payloads)
     }
 
     const before = await p.locator(SELECTORS.assistant).count()
@@ -647,7 +693,7 @@ class MuseDriver {
     return this._serial(() => this._chatMedia(chat, opts), typeof chat === 'string' ? chat : undefined)
   }
 
-  async _chatMedia(chat, { download = false, dir } = {}) {
+  async _chatMedia(chat, { download = false, dir, images = false, maxSize = DEFAULT_MAX_SIZE, which = 'last', baseline } = {}) {
     const p = await this.requirePage()
     if (chat !== undefined && chat !== null && chat !== '') await this._openChat(chat)
     else await this.gotoApp()
@@ -672,7 +718,86 @@ class MuseDriver {
     const all = [...new Set(items.flatMap((m) => m.urls))]
     const result = { items, urls: all, count: all.length, threadUrl: p.url() }
     if (download && all.length) result.downloads = await this._downloadMedia(all, dir)
+    if (images) Object.assign(result, await this._mediaImages(all, { maxSize, which, baseline }))
     return result
+  }
+
+  /**
+   * Turn a thread's media URLs (DOM order, oldest first) into PNGs ready for MCP image blocks, and measure
+   * how much the newest image differs from the one before it (or from `baseline`: a file path, or the
+   * 16-hex `hash` an earlier call returned). Raw PNG bytes go in `imageBuffers`, which the MCP server
+   * strips out of the JSON it returns.
+   */
+  async _mediaImages(urls, { maxSize, which, baseline }) {
+    const found = []
+    for (const u of urls.slice(-MAX_MEDIA_FETCH)) {
+      if (/\.(mp4|webm|mov)(\?|$)/i.test(u)) continue
+      const got = await this._fetchBytes(u).catch(() => null)
+      if (!got || !/^image\//i.test(got.mime || 'image/')) continue
+      try {
+        const { width, height } = await dimensions(got.buf)
+        if (width < MIN_MEDIA_SIDE && height < MIN_MEDIA_SIDE) continue
+        found.push({ url: u, buf: got.buf, width, height })
+      } catch { /* not a decodable image (e.g. an html share page) */ }
+    }
+
+    const newest = found[found.length - 1]
+    const diff = { changedPct: null, changed: null, dhashHamming: null, comparedWith: 'none' }
+    if (newest && baseline) {
+      if (/^[0-9a-f]{16}$/i.test(baseline)) {
+        diff.dhashHamming = hammingHex(await hashHex(newest.buf), baseline)
+        diff.changed = diff.dhashHamming > 0
+        diff.comparedWith = 'baseline-hash'
+        diff.note = 'a hash baseline gives dhashHamming only; pass a file path for changedPct.'
+      } else if (fs.existsSync(baseline)) {
+        Object.assign(diff, await compare(fs.readFileSync(baseline), newest.buf), { comparedWith: 'baseline-file' })
+        diff.changed = diff.changedPct >= CHANGED_THRESHOLD_PCT
+      } else {
+        diff.note = `baseline not found: ${baseline}`
+      }
+    } else if (found.length >= 2) {
+      Object.assign(diff, await compare(found[found.length - 2].buf, newest.buf), { comparedWith: 'previous-image' })
+      diff.changed = diff.changedPct >= CHANGED_THRESHOLD_PCT
+    } else if (newest) {
+      diff.note = 'only one image in the thread; pass baseline to compare across turns.'
+    }
+
+    const picked = which === 'all' ? found : newest ? [newest] : []
+    const imagesOut = []
+    const imageBuffers = []
+    for (const img of picked) {
+      const png = await toPng(img.buf, maxSize)
+      imageBuffers.push(png.buffer)
+      imagesOut.push({
+        url: img.url.startsWith('blob:') ? 'blob' : img.url,
+        sourceWidth: img.width, sourceHeight: img.height,
+        width: png.width, height: png.height, bytes: png.bytes,
+        hash: await hashHex(img.buf),
+      })
+    }
+    return { imageCount: found.length, images: imagesOut, imageBuffers, ...diff }
+  }
+
+  /** Fetch a media URL's bytes, in the page first (blob: URLs, cookie-authed http), then from Node. */
+  async _fetchBytes(u) {
+    const p = this.page
+    if (p && !p.isClosed()) {
+      const r = await p.evaluate(async (url) => {
+        try {
+          const res = await fetch(url)
+          const bytes = new Uint8Array(await res.arrayBuffer())
+          let s = ''
+          const CH = 0x8000
+          for (let i = 0; i < bytes.length; i += CH) s += String.fromCharCode.apply(null, bytes.subarray(i, i + CH))
+          return { ok: res.ok, status: res.status, mime: res.headers.get('content-type') || '', b64: btoa(s) }
+        } catch (e) { return { ok: false, error: String(e) } }
+      }, u)
+      if (r && r.ok && r.b64) return { buf: Buffer.from(r.b64, 'base64'), mime: r.mime }
+      if (r && r.error && u.startsWith('blob:')) throw new Error(r.error)
+    }
+    const res = await fetch(u, { signal: AbortSignal.timeout(ATTACH_FETCH_TIMEOUT_MS) })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    return { buf: Buffer.from(await res.arrayBuffer()), mime: res.headers.get('content-type') || '' }
   }
 
   async downloadMedia(urls, dir) {
@@ -682,34 +807,10 @@ class MuseDriver {
   async _downloadMedia(urls, dir) {
     const outDir = dir || path.join(__dirname, 'downloads')
     fs.mkdirSync(outDir, { recursive: true })
-    const p = this.page
     const saved = []
     for (const u of urls) {
       try {
-        let buf = null
-        let mime = ''
-        // Prefer fetching inside the page: handles blob: URLs and cookie-authed http.
-        if (p && !p.isClosed()) {
-          const r = await p.evaluate(async (url) => {
-            try {
-              const res = await fetch(url)
-              const ab = await res.arrayBuffer()
-              const bytes = new Uint8Array(ab)
-              let s = ''
-              const CH = 0x8000
-              for (let i = 0; i < bytes.length; i += CH) s += String.fromCharCode.apply(null, bytes.subarray(i, i + CH))
-              return { ok: res.ok, status: res.status, mime: res.headers.get('content-type') || '', b64: btoa(s), len: bytes.length }
-            } catch (e) { return { ok: false, error: String(e) } }
-          }, u)
-          if (r && r.ok && r.b64) { buf = Buffer.from(r.b64, 'base64'); mime = r.mime }
-          else if (r && r.error) throw new Error(r.error)
-        }
-        if (!buf) {
-          const res = await fetch(u)
-          if (!res.ok) throw new Error(`HTTP ${res.status}`)
-          buf = Buffer.from(await res.arrayBuffer())
-          mime = res.headers.get('content-type') || ''
-        }
+        const { buf, mime } = await this._fetchBytes(u)
         const ext = mime.includes('mp4') ? '.mp4' : mime.includes('webm') ? '.webm' : mime.includes('webp') ? '.webp'
           : mime.includes('png') ? '.png' : (mime.includes('jpeg') || mime.includes('jpg')) ? '.jpg' : mime.includes('gif') ? '.gif' : ''
         let name = 'media'

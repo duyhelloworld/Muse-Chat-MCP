@@ -146,14 +146,30 @@ export function buildServer() {
     'muse_media',
     {
       title: 'Muse chat media',
-      description: 'Extract image/video/attachment links from a chat (Muse replies with share links for generated media). Optionally download them. Several agents may share Muse at once: pass chat = the threadUrl muse_chat returned, or you may read another agent\'s thread.',
+      description: 'Extract image/video/attachment links from a chat and return the newest image INLINE (webp converted to PNG), plus changedPct: how much it differs from the previous image (or from baseline). Muse sometimes claims an edit it did not make; changed=false / changedPct near 0 means the image is unchanged. Optionally download the originals. Several agents may share Muse at once: pass chat = the threadUrl muse_chat returned, or you may read another agent\'s thread.',
       inputSchema: {
         chat: z.union([z.string(), z.number()]).optional().describe('Chat to open first (title, index, URL, or id).'),
-        download: z.boolean().optional().describe('Download the media to disk (default false).'),
+        as_image: z.boolean().optional().describe('Return images as inline image blocks (default true). false = links only, like before.'),
+        which: z.enum(['last', 'all']).optional().describe("Inline only the newest image (default 'last') or every image found ('all')."),
+        max_size: z.number().int().positive().max(4096).optional().describe('Longest side in px of the inline PNGs (default 1024). Lower it to spend fewer tokens.'),
+        baseline: z.string().optional().describe('Compare the newest image against an earlier one: a file path (gives changedPct) or the 16-hex hash a previous muse_media returned (gives dhashHamming).'),
+        download: z.boolean().optional().describe('Download the original media to disk (default false).'),
         dir: z.string().optional().describe('Directory for downloads (default: ./downloads next to the server).'),
       },
     },
-    wrap(async ({ chat, download, dir }) => driver.chatMedia(chat, { download: !!download, dir })),
+    async ({ chat, as_image, which, max_size, baseline, download, dir } = {}) => {
+      try {
+        const { imageBuffers = [], ...result } = await driver.chatMedia(chat, {
+          download: !!download, dir, images: as_image !== false, which, maxSize: max_size, baseline,
+        })
+        const content = [{ type: 'text', text: JSON.stringify(result, null, 2) }]
+        for (const buf of imageBuffers) content.push({ type: 'image', data: buf.toString('base64'), mimeType: 'image/png' })
+        return { content }
+      } catch (err) {
+        log('tool error:', err && err.message)
+        return { isError: true, content: [{ type: 'text', text: `Muse error: ${err && err.message ? err.message : String(err)}` }] }
+      }
+    },
   )
 
   server.registerTool(

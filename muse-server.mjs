@@ -18,7 +18,7 @@
  * Config (env):
  *   MUSE_PROFILE_DIR   dedicated Chrome profile (default: ./.muse-profile)
  *   MUSE_URL           app URL (default https://muse.ai/)
- *   MUSE_HEADLESS=1    run headless (login must be done beforehand)
+ *   MUSE_HEADLESS=0    show the Chrome window (default: headless; muse_login shows it for sign-in)
  *   MUSE_CHANNEL       chrome | msedge   (default chrome)
  * ------------------------------------------------------------------
  */

@@ -52,7 +52,9 @@ export const SELECTORS = {
 const APP_URL = process.env.MUSE_URL || 'https://muse.ai/'
 const PROFILE_DIR =
   process.env.MUSE_PROFILE_DIR || path.join(__dirname, '.muse-profile')
-const HEADLESS = process.env.MUSE_HEADLESS === '1'
+// Headless by default: with no window, Chrome has nothing to activate, so a call can never pull the
+// user's keystrokes into Muse. MUSE_HEADLESS=0 shows the window; muse_login shows it when sign-in is needed.
+const HEADLESS = process.env.MUSE_HEADLESS !== '0'
 const CHANNEL = process.env.MUSE_CHANNEL || 'chrome'
 const LAUNCH_TIMEOUT = Number(process.env.MUSE_LAUNCH_TIMEOUT_MS || 60000)
 // Streaming: only surface text that has been stable this long, so we never emit
@@ -118,6 +120,7 @@ class MuseDriver {
     this._idle = []
     this._waiters = []
     this._launching = null
+    this.headless = HEADLESS
   }
 
   /** The tab of the current call (inside _serial), else the one the latest call used. */
@@ -253,7 +256,7 @@ class MuseDriver {
       '--disable-backgrounding-occluded-windows',
       '--disable-renderer-backgrounding',
       '--window-size=1366,900',
-      ...(HEADLESS ? ['--headless=new'] : []),
+      ...(this.headless ? ['--headless=new'] : []),
       // Chrome activates itself when it opens its first window, even under `open -g`. Start with none:
       // every call's tab is a background one (_newBackgroundPage) and goes to APP_URL itself.
       '--no-startup-window',
@@ -330,7 +333,7 @@ class MuseDriver {
   async status() {
     if (!this.isRunning()) {
       try { await this.launch() } catch (e) {
-        return { browserRunning: false, url: null, loggedIn: false, composerReady: false, profileDir: PROFILE_DIR, headless: HEADLESS, error: e.message }
+        return { browserRunning: false, url: null, loggedIn: false, composerReady: false, profileDir: PROFILE_DIR, headless: this.headless, error: e.message }
       }
     }
     return this._serial(async () => {
@@ -344,7 +347,7 @@ class MuseDriver {
         viewerId: auth.viewerId || null,
         composerReady,
         profileDir: PROFILE_DIR,
-        headless: HEADLESS,
+        headless: this.headless,
         cdp: `127.0.0.1:${CDP_PORT}`,
         tabs: this._tabs.size,
       }
@@ -353,7 +356,18 @@ class MuseDriver {
 
   /** Open the app and, if needed, wait for the user to complete Meta login. */
   async login(timeoutMs = 300000) {
+    if (this.headless && !(await this.status()).loggedIn) await this._relaunchWithWindow()
     return this._serial(() => this._login(timeoutMs))
+  }
+
+  /** Meta sign-in needs a window the user can type in: restart the shared Chrome headful. */
+  async _relaunchWithWindow() {
+    this.headless = false
+    const cdp = await this.browser.newBrowserCDPSession()
+    await cdp.send('Browser.close').catch(() => {})
+    const deadline = Date.now() + 10000
+    while (this.isRunning() && Date.now() < deadline) await sleep(200)
+    await sleep(1000) // let Chrome release the profile lock before the next launch takes it
   }
 
   async _login(timeoutMs) {

@@ -154,12 +154,37 @@ class MuseDriver {
         return this._idle.splice(i, 1)[0]
       }
       if (this._tabs.size < MAX_TABS) {
-        const p = await this.ctx.newPage()
+        const p = await this._newBackgroundPage()
         p.setDefaultTimeout(LAUNCH_TIMEOUT)
         this._tabs.add(p)
         return p
       }
       await new Promise((r) => this._waiters.push(r))
+    }
+  }
+
+  /**
+   * ctx.newPage() opens a FOREGROUND tab, and Chrome then activates its window: whatever the user was
+   * typing in (another app) lands in Muse's address bar. A background tab never takes focus; Playwright
+   * drives it over CDP all the same.
+   */
+  async _newBackgroundPage() {
+    const cdp = await this.browser.newBrowserCDPSession()
+    try {
+      const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank', background: true })
+      const deadline = Date.now() + 10000
+      while (Date.now() < deadline) {
+        for (const p of this.ctx.pages()) {
+          if (this._tabs.has(p) || p.isClosed()) continue
+          const s = await this.ctx.newCDPSession(p)
+          const { targetInfo } = await s.send('Target.getTargetInfo').finally(() => s.detach().catch(() => {}))
+          if (targetInfo.targetId === targetId) return p
+        }
+        await sleep(100)
+      }
+      throw new Error(`background tab ${targetId} never showed up in Playwright`)
+    } finally {
+      cdp.detach().catch(() => {})
     }
   }
 
@@ -229,9 +254,16 @@ class MuseDriver {
       '--disable-renderer-backgrounding',
       '--window-size=1366,900',
       ...(HEADLESS ? ['--headless=new'] : []),
-      APP_URL,
+      // Chrome activates itself when it opens its first window, even under `open -g`. Start with none:
+      // every call's tab is a background one (_newBackgroundPage) and goes to APP_URL itself.
+      '--no-startup-window',
     ]
-    const child = spawn(CHROME_PATH, args, { detached: true, stdio: 'ignore' })
+    // macOS: spawning the binary makes Chrome the active app; `open -g -n` starts a new instance without
+    // bringing it to the front, so the user keeps typing where they were.
+    const appBundle = process.platform === 'darwin' && CHROME_PATH.match(/^(.*?\.app)\//)
+    const child = appBundle
+      ? spawn('open', ['-g', '-n', '-a', appBundle[1], '--args', ...args], { detached: true, stdio: 'ignore' })
+      : spawn(CHROME_PATH, args, { detached: true, stdio: 'ignore' })
     child.on('error', () => {})
     child.unref()
     const deadline = Date.now() + 20000
